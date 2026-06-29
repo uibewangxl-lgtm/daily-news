@@ -1,0 +1,6 @@
+news_cache/
+__pycache__/
+*.pyc
+.DS_Store
+local_test.md
+
