@@ -29,15 +29,5 @@ jobs:
           SENDKEY: ${{ secrets.SENDKEY }}
         run: python news_digest.py
 
-      - name: 💾 提交日报存档
-        run: |
-          git config user.name "news-bot"
-          git config user.email "bot@daily-news.local"
-          git add *.md 2>/dev/null || true
-          git diff --quiet && git diff --staged --quiet || \
-            git commit -m "📰 每日新闻速览 $(date +'%Y-%m-%d' -d '+8 hours')"
-          git push
-
-      - name: ✅ 完成通知
+      - name: ✅ 完成
         run: echo "每日新闻推送完成"
-
