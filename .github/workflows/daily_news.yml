@@ -1,0 +1,43 @@
+name: 每日新闻推送
+
+on:
+  schedule:
+    - cron: "30 23 * * *"
+  workflow_dispatch:
+
+jobs:
+  news-digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 📥 检出代码
+        uses: actions/checkout@v4
+
+      - name: 🐍 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 📦 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 📬 抓取并推送新闻
+        env:
+          SENDKEY: ${{ secrets.SENDKEY }}
+        run: python news_digest.py
+
+      - name: 💾 提交日报存档
+        run: |
+          git config user.name "news-bot"
+          git config user.email "bot@daily-news.local"
+          git add *.md 2>/dev/null || true
+          git diff --quiet && git diff --staged --quiet || \
+            git commit -m "📰 每日新闻速览 $(date +'%Y-%m-%d' -d '+8 hours')"
+          git push
+
+      - name: ✅ 完成通知
+        run: echo "每日新闻推送完成"
+
