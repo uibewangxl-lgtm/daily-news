@@ -1,241 +1,198 @@
 #!/usr/bin/env python3
-"""每日新闻速览 - 抓取 RSS 新闻并推送到微信 (ServerChan)"""
-
-import os
-import re
-import sys
-import time
-import logging
+# -*- coding: utf-8 -*-
+import os, re, sys, time, logging
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
-
-import feedparser
-import requests
+import feedparser, requests
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-# ── RSS 源配置（按领域分组）────────────────────────────────────────────
-RSS_SOURCES = {
-    "🌍 时政·国际": [
-        ("联合早报", "https://www.zaobao.com/recent.rss"),
-        ("BBC中文", "https://feeds.bbci.co.uk/zhongwen/simp/rss.xml"),
-        ("Reuters", "https://www.reutersagency.com/feed/"),
+SENDKEY = os.environ.get("SENDKEY", "")
+if not SENDKEY:
+    log.error("环境变量 SENDKEY 未设置"); sys.exit(1)
+NO_TRANSLATE = os.environ.get("NO_TRANSLATE", "") == "1"
+TZ_CST = timezone(timedelta(hours=8))
+SCURL = "https://sctapi.ftqq.com/" + SENDKEY + ".send"
+
+RSS = {
+    "\U0001f30d \u65f6\u653f\u00b7\u56fd\u9645": [
+        ("ABC News", "https://feeds.abcnews.com/abcnews/topstories"),
+        ("ABC News\u00b7\u56fd\u9645", "https://feeds.abcnews.com/abcnews/internationalheadlines"),
     ],
-    "💻 科技": [
-        ("Hacker News", "https://hnrss.org/frontpage?count=20"),
-        ("少数派", "https://sspai.com/feed"),
+    "\U0001f4bb \u79d1\u6280": [
+        ("Hacker News", "https://hnrss.org/frontpage"),
         ("ArsTechnica", "https://feeds.arstechnica.com/arstechnica/index"),
     ],
-    "📈 财经·商业": [
-        ("36氪", "https://36kr.com/feed"),
+    "\U0001f4c8 \u8d22\u7ecf\u00b7\u5546\u4e1a": [
         ("TechCrunch", "https://techcrunch.com/feed/"),
-        ("华尔街见闻", "https://wallstreetcn.com/rss"),
     ],
-    "🏘️ 社会·民生": [
-        ("知乎日报", "https://daily.zhihu.com/rss"),
-        ("The Guardian", "https://www.theguardian.com/world/rss"),
+    "\U0001f3d8\ufe0f \u793e\u4f1a\u00b7\u6c11\u751f": [
+        ("NPR", "https://feeds.npr.org/1001/rss.xml"),
     ],
-    "🔬 科学·健康": [
-        ("果壳网", "https://www.guokr.com/rss.xml"),
+    "\U0001f52c \u79d1\u5b66\u00b7\u5065\u5eb7": [
         ("Nature", "https://www.nature.com/nature.rss"),
     ],
 }
+T1 = {"ABC News","ABC News\u00b7\u56fd\u9645","Nature","ArsTechnica","NPR"}
+T2 = {"TechCrunch","Hacker News"}
+KW_H = ["breakthrough","launch","first","major","crisis","emergency",
+        "agreement","sanction","elected","resign","killed","discover",
+        "announce","supreme court","president","congress"]
+KW_M = ["report","study","found","warn","accuse","record","ban"]
+_tl = None
 
-SENDKEY = os.environ.get("SENDKEY", "")
-if not SENDKEY:
-    log.error("环境变量 SENDKEY 未设置")
-    sys.exit(1)
+def gtl():
+    global _tl
+    if not _tl:
+        from deep_translator import GoogleTranslator
+        _tl = GoogleTranslator(source="auto", target="zh-CN")
+    return _tl
 
-SERVERCHAN_URL = f"https://sctapi.ftqq.com/{SENDKEY}.send"
+def zh(s): return bool(re.search(r"[\u4e00-\u9fff]", s))
 
-TZ_CST = timezone(timedelta(hours=8))
+def tl(s):
+    if not s or zh(s): return s
+    if NO_TRANSLATE: return s
+    try: return gtl().translate(s[:1500])
+    except: return s
 
-
-# ── 工具函数 ───────────────────────────────────────────────────────────
-
-def fetch_feed(url, timeout=15):
-    """抓取并解析 RSS 源，失败返回空列表"""
+def fetch(url):
     try:
-        feed = feedparser.parse(url)
-        if feed.bozo and not feed.entries:
-            log.warning("解析失败 (bozo): %s", url)
-            return []
-        log.info("  ✓ %s → %d 条", url, len(feed.entries))
-        return feed.entries
+        r = requests.get(url, timeout=(5,8), headers={"User-Agent":"Mozilla/5.0"})
+        r.raise_for_status()
+        f = feedparser.parse(r.content)
+        log.info("  %d <- %s", len(f.entries), url.split("/")[2])
+        return f.entries
     except Exception as e:
-        log.warning("  ✗ %s → %s", url, e)
-        return []
+        log.warning("  fail %s", str(e)[:80]); return []
 
+def safe(s):
+    if not s: return ""
+    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", str(s)).strip()
 
-def safe_str(text):
-    """清理文本中的非法字符"""
-    if not text:
-        return ""
-    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", str(text))
-    return text.strip()
-
-
-def extract_pubdate(entry):
-    """统一解析发布日期"""
-    for attr in ("published_parsed", "updated_parsed"):
-        parsed = getattr(entry, attr, None)
-        if parsed:
-            try:
-                return datetime(*parsed[:6], tzinfo=timezone.utc)
-            except Exception:
-                pass
+def pub(e):
+    for a in ("published_parsed","updated_parsed"):
+        p = getattr(e,a,None)
+        if p:
+            try: return datetime(*p[:6],tzinfo=timezone.utc)
+            except: pass
     return datetime.now(timezone.utc)
 
+SW = {"the","a","an","in","on","at","to","for","of","with","and","its","has","was","new"}
 
-def truncate(text, max_len=80):
-    """截断长文本"""
-    if len(text) > max_len:
-        return text[:max_len].rstrip() + "…"
-    return text
+def xref(items):
+    rr = []
+    for it in items:
+        w = set(w for w in re.sub(r"[^\w]"," ",it[2][:25]).lower().split()
+                if len(w)>2 and w not in SW)
+        rr.append((it[0],it[1],w))
+    c = [0]*len(items)
+    for i in range(len(items)):
+        for j in range(i+1,len(items)):
+            if rr[i][1]!=rr[j][1] and len(rr[i][2]&rr[j][2])>=3:
+                c[i]+=1;c[j]+=1
+    return c
 
+def ssc(n):
+    if n in T1: return 10
+    if n in T2: return 5
+    return 2
 
-# ── 核心逻辑 ───────────────────────────────────────────────────────────
+def kwsc(t):
+    lo=t.lower();s=0
+    for kw in KW_H:
+        if kw.lower() in lo: s+=5
+    for kw in KW_M:
+        if kw.lower() in lo: s+=2
+    return s
 
-def collect_news():
-    """从所有 RSS 源抓取新闻，按领域和来源分类"""
-    all_news = []  # [(category_label, source_name, title, url, summary, pubdate)]
-    for category, sources in RSS_SOURCES.items():
-        for name, url in sources:
-            entries = fetch_feed(url)
-            for entry in entries:
-                title = safe_str(entry.get("title", ""))
-                if not title:
-                    continue
-                link = entry.get("link", "")
-                summary = safe_str(entry.get("summary", "") or entry.get("description", ""))
-                summary = summary[:200]
-                pubdate = extract_pubdate(entry)
-                all_news.append((category, name, title, link, summary, pubdate))
-    return all_news
+def rank(news):
+    xr = xref(news)
+    nw = datetime.now(timezone.utc)
+    out = []
+    for i,(c,s,t,l,su,p) in enumerate(news):
+        tt = ssc(s)+kwsc(t)+xr[i]*3
+        if (nw-p).total_seconds()/3600<24: tt+=5
+        out.append((tt,c,s,t,l,su,p,xr[i]))
+    out.sort(key=lambda x:x[0],reverse=True)
+    return out
 
+def sel(sc,n=20):
+    bc = defaultdict(list)
+    for it in sc: bc[it[1]].append(it)
+    for c in bc: bc[c].sort(key=lambda x:x[0],reverse=True)
+    q = sorted(bc,key=lambda c:sum(x[0] for x in bc[c]),reverse=True)
+    s = []
+    while q and len(s)<n:
+        c = q.pop(0)
+        if bc[c]:
+            s.append(bc[c].pop(0))
+            if bc[c]: q.append(c)
+    return s
 
-def deduplicate(news_list):
-    """基于标题前 20 字去重"""
-    seen = set()
-    result = []
-    for item in news_list:
-        key = item[2][:20].lower().strip()
-        if key and key not in seen:
-            seen.add(key)
-            result.append(item)
-    return result
+def tr(s,n=80):
+    return s[:n].rstrip()+".." if len(s)>n else s
 
+def focus(top):
+    _,c,s,t,l,su,p,r = top[0]
+    a = ["**"+tl(t)+"**"]
+    if su: a.append(tl(tr(su,120)))
+    if r>=2: a.append("(多家媒体)")
+    return " | ".join(a)
 
-def select_top(news_list, n=20):
-    """从各领域轮询选取 n 条最重要的新闻"""
-    # 按领域分组
-    by_category = defaultdict(list)
-    for item in news_list:
-        by_category[item[0]].append(item)
+def fmt(items):
+    nw = datetime.now(TZ_CST)
+    ls = ["\U0001f4f0 **\u6bcf\u65e5\u65b0\u95fb\u901f\u89c8 - " + nw.strftime("%Y\u5e74%m\u6708%d\u65e5") + "**","",
+          "\u5171 " + str(len(items)) + " \u6761 | \U0001f550 " + nw.strftime("%H:%M"),"","---",""]
+    for i,(sc,c,s,t,l,su,p,r) in enumerate(items,1):
+        tc = tl(t)
+        sc2 = tl(su) if su else ""
+        rt = " (x"+str(r)+")" if r>=2 else ""
+        ls.append(str(i)+". "+c+" **"+tr(tc,60)+"**"+rt)
+        ls.append("   "+ (tr(sc2,90) if sc2 else tr(tc,60)))
+        ls.append("")
+    ls.extend(["---","","\U0001f4cc **\u4eca\u65e5\u7126\u70b9**："+focus(items),"",""])
+    return "\n".join(ls)
 
-    # 各组内按时间排序（最新的靠前）
-    for cat in by_category:
-        by_category[cat].sort(key=lambda x: x[5], reverse=True)
-
-    # 轮询选取, 优先从每个分类取，保证覆盖面
-    selected = []
-    categories = list(by_category.keys())
-    # 按领域条目数从多到少排序（避免小领域被饿死）
-    categories.sort(key=lambda c: len(by_category[c]), reverse=True)
-
-    # 先给每个分类至少 1 条
-    queue = list(categories)
-    while queue and len(selected) < n:
-        cat = queue.pop(0)
-        if by_category[cat]:
-            selected.append(by_category[cat].pop(0))
-            if by_category[cat]:
-                queue.append(cat)
-
-    return selected[:n]
-
-
-def format_digest(news_items):
-    """格式化为 ServerChan 的 Markdown 消息体"""
-    today_cn = datetime.now(TZ_CST).strftime("%Y年%m月%d日")
-    today_short = datetime.now(TZ_CST).strftime("%Y-%m-%d")
-
-    lines = []
-    lines.append(f"📰 **每日新闻速览 · {today_cn}**")
-    lines.append("")
-
-    for i, (cat, source, title, link, summary, _pub) in enumerate(news_items, 1):
-        short_summary = truncate(summary, 80) if summary else truncate(title, 60)
-        lines.append(f"{i}. {cat} [{source}] **{title}**")
-        lines.append(f"   > {short_summary}")
-        if link:
-            lines.append(f"   [阅读原文]({link})")
-        lines.append("")
-
-    lines.append("---")
-    lines.append("")
-    # 今日焦点：取第一条
-    top = news_items[0]
-    lines.append(f"📌 **今日焦点**：{top[2]}")
-    lines.append("")
-    lines.append(f"🕐 推送时间：{datetime.now(TZ_CST).strftime('%H:%M')}")
-    lines.append("")
-
-    return "\n".join(lines)
-
-
-def push_to_wechat(title, content):
-    """通过 ServerChan 推送到微信"""
-    resp = requests.post(
-        SERVERCHAN_URL,
-        data={"title": title, "desp": content},
-        timeout=20,
-    )
-    result = resp.json()
-    if result.get("code") == 0:
-        log.info("推送成功: %s", result.get("data", {}).get("pushid", ""))
-        return True
-    else:
-        log.error("推送失败: %s", result.get("message", "未知错误"))
-        return False
-
-
-# ── 主流程 ─────────────────────────────────────────────────────────────
+def push(title,body):
+    r = requests.post(SCURL, data={"title":title,"desp":body}, timeout=20)
+    j = r.json()
+    if j.get("code")==0:
+        log.info("OK push %s", j.get("data",{}).get("pushid","")); return True
+    log.error("FAIL: %s", j.get("message","")); return False
 
 def main():
-    start = time.time()
-    log.info("=" * 50)
-    log.info("开始抓取新闻…")
+    t0 = time.time()
+    today = datetime.now(TZ_CST).strftime("%Y-%m-%d")
+    log.info("="*40)
+    log.info("start %s", today)
+    raw = []
+    for cat,sources in RSS.items():
+        for name,url in sources:
+            for e in fetch(url):
+                ti = safe(e.get("title",""))
+                if not ti: continue
+                raw.append((cat,name,ti,e.get("link",""),
+                    safe(e.get("summary","") or e.get("description",""))[:200],pub(e)))
+    log.info("raw %d", len(raw))
+    seen,ded = set(),[]
+    for it in raw:
+        k = it[2][:20].lower().strip()
+        if k and k not in seen: seen.add(k); ded.append(it)
+    log.info("dedup %d", len(ded))
+    scored = rank(ded)
+    if scored: log.info("top %.0f - %s",scored[0][0],scored[0][3][:60])
+    top = sel(scored,20)
+    for i,it in enumerate(top,1):
+        log.info("  %2d. [%3.0f] %s",i,it[0],it[3][:60])
+    body = fmt(top)
+    title = "\U0001f4f0 \u6bcf\u65e5\u65b0\u95fb\u901f\u89c8 - "+today
+    with open(today+".md","w",encoding="utf-8") as f: f.write(body)
+    log.info("saved %s.md", today)
+    ok = push(title,body)
+    log.info("done %.1fs", time.time()-t0)
+    if not ok: sys.exit(1)
 
-    today_short = datetime.now(TZ_CST).strftime("%Y-%m-%d")
-
-    all_news = collect_news()
-    log.info("共抓取 %d 条原始新闻", len(all_news))
-
-    all_news = deduplicate(all_news)
-    log.info("去重后 %d 条", len(all_news))
-
-    top_news = select_top(all_news, n=20)
-    log.info("精选 %d 条", len(top_news))
-
-    content = format_digest(top_news)
-    title = f"📰 每日新闻速览 · {today_short}"
-
-    # 也保存本地一份
-    output_path = os.path.join(os.path.dirname(__file__) or ".", f"{today_short}.md")
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(content)
-    log.info("已保存到 %s", output_path)
-
-    success = push_to_wechat(title, content)
-    elapsed = time.time() - start
-    log.info("耗时 %.1f 秒", elapsed)
-
-    if not success:
-        sys.exit(1)
-
-
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
-
