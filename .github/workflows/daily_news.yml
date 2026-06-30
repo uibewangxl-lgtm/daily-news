@@ -3,6 +3,7 @@ name: 每日新闻推送
 on:
   schedule:
     - cron: "30 23 * * *"
+    - cron: "35 11 * * *"
   workflow_dispatch:
 
 jobs:
